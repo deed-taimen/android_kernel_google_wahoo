@@ -1494,6 +1494,7 @@ struct mpage_da_data {
 	 */
 	struct ext4_map_blocks map;
 	struct ext4_io_submit io_submit;	/* IO submission data */
+	unsigned int do_map:1;
 };
 
 static void mpage_release_unused_pages(struct mpage_da_data *mpd,
@@ -1530,6 +1531,8 @@ static void mpage_release_unused_pages(struct mpage_da_data *mpd,
 			BUG_ON(!PageLocked(page));
 			BUG_ON(PageWriteback(page));
 			if (invalidate) {
+				if (page_mapped(page))
+					clear_page_dirty_for_io(page);
 				block_invalidatepage(page, 0, PAGE_CACHE_SIZE);
 				ClearPageUptodate(page);
 			}
@@ -2036,6 +2039,9 @@ static bool mpage_add_bh_to_extent(struct mpage_da_data *mpd, ext4_lblk_t lblk,
 
 	/* First block in the extent? */
 	if (map->m_len == 0) {
+		/* We cannot map unless handle is started... */
+		if (!mpd->do_map)
+			return false;
 		map->m_lblk = lblk;
 		map->m_len = 1;
 		map->m_flags = bh->b_state & BH_FLAGS;
@@ -2087,6 +2093,9 @@ static int mpage_process_page_bufs(struct mpage_da_data *mpd,
 		if (lblk >= blocks || !mpage_add_bh_to_extent(mpd, lblk, bh)) {
 			/* Found extent to map? */
 			if (mpd->map.m_len)
+				return 0;
+			/* Buffer needs mapping and handle is not started? */
+			if (!mpd->do_map)
 				return 0;
 			/* Everything mapped so far and we hit EOF */
 			break;
@@ -2594,6 +2603,29 @@ retry:
 		tag_pages_for_writeback(mapping, mpd.first_page, mpd.last_page);
 	done = false;
 	blk_start_plug(&plug);
+
+	/*
+	 * First writeback pages that don't need mapping - we can avoid
+	 * starting a transaction unnecessarily and also avoid being blocked
+	 * in the block layer on device congestion while having transaction
+	 * started.
+	 */
+	mpd.do_map = 0;
+	mpd.io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+	if (!mpd.io_submit.io_end) {
+		ret = -ENOMEM;
+		goto unplug;
+	}
+	ret = mpage_prepare_extent_to_map(&mpd);
+	/* Submit prepared bio */
+	ext4_io_submit(&mpd.io_submit);
+	ext4_put_io_end_defer(mpd.io_submit.io_end);
+	mpd.io_submit.io_end = NULL;
+	/* Unlock pages we didn't use */
+	mpage_release_unused_pages(&mpd, false);
+	if (ret < 0)
+		goto unplug;
+
 	while (!done && mpd.first_page <= mpd.last_page) {
 		/* For each extent of pages we use new io_end */
 		mpd.io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
@@ -2622,8 +2654,10 @@ retry:
 				wbc->nr_to_write, inode->i_ino, ret);
 			/* Release allocated io_end */
 			ext4_put_io_end(mpd.io_submit.io_end);
+			mpd.io_submit.io_end = NULL;
 			break;
 		}
+		mpd.do_map = 1;
 
 		trace_ext4_da_write_pages(inode, mpd.first_page, mpd.wbc);
 		ret = mpage_prepare_extent_to_map(&mpd);
@@ -2654,6 +2688,7 @@ retry:
 		if (!ext4_handle_valid(handle) || handle->h_sync == 0) {
 			ext4_journal_stop(handle);
 			handle = NULL;
+			mpd.do_map = 0;
 		}
 		/* Submit prepared bio */
 		ext4_io_submit(&mpd.io_submit);
@@ -2671,6 +2706,7 @@ retry:
 			ext4_journal_stop(handle);
 		} else
 			ext4_put_io_end(mpd.io_submit.io_end);
+		mpd.io_submit.io_end = NULL;
 
 		if (ret == -ENOSPC && sbi->s_journal) {
 			/*
@@ -2686,6 +2722,7 @@ retry:
 		if (ret)
 			break;
 	}
+unplug:
 	blk_finish_plug(&plug);
 	if (!ret && !cycled && wbc->nr_to_write > 0) {
 		cycled = 1;
@@ -3282,29 +3319,29 @@ static ssize_t ext4_ext_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 	 * case, we allocate an io_end structure to hook to the iocb.
 	 */
 	iocb->private = NULL;
-	ext4_inode_aio_set(inode, NULL);
-	if (!is_sync_kiocb(iocb)) {
-		io_end = ext4_init_io_end(inode, GFP_NOFS);
-		if (!io_end) {
-			ret = -ENOMEM;
-			goto retake_lock;
-		}
-		/*
-		 * Grab reference for DIO. Will be dropped in ext4_end_io_dio()
-		 */
-		iocb->private = ext4_get_io_end(io_end);
-		/*
-		 * we save the io structure for current async direct
-		 * IO, so that later ext4_map_blocks() could flag the
-		 * io structure whether there is a unwritten extents
-		 * needs to be converted when IO is completed.
-		 */
-		ext4_inode_aio_set(inode, io_end);
-	}
-
 	if (overwrite) {
 		get_block_func = ext4_get_block_write_nolock;
 	} else {
+		ext4_inode_aio_set(inode, NULL);
+		if (!is_sync_kiocb(iocb)) {
+			io_end = ext4_init_io_end(inode, GFP_NOFS);
+			if (!io_end) {
+				ret = -ENOMEM;
+				goto retake_lock;
+			}
+			/*
+			 * Grab reference for DIO. Will be dropped in
+			 * ext4_end_io_dio()
+			 */
+			iocb->private = ext4_get_io_end(io_end);
+			/*
+			 * we save the io structure for current async direct
+			 * IO, so that later ext4_map_blocks() could flag the
+			 * io structure whether there is a unwritten extents
+			 * needs to be converted when IO is completed.
+			 */
+			ext4_inode_aio_set(inode, io_end);
+		}
 		get_block_func = ext4_get_block_write;
 		dio_flags = DIO_LOCKING;
 	}
@@ -4300,6 +4337,12 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
 	if (ret < 0)
 		goto bad_inode;
 	raw_inode = ext4_raw_inode(&iloc);
+
+	if ((ino == EXT4_ROOT_INO) && (raw_inode->i_links_count == 0)) {
+		EXT4_ERROR_INODE(inode, "root inode unallocated");
+		ret = -EFSCORRUPTED;
+		goto bad_inode;
+	}
 
 	if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE) {
 		ei->i_extra_isize = le16_to_cpu(raw_inode->i_extra_isize);
